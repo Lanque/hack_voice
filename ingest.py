@@ -1,6 +1,6 @@
 """
 PDF ingestion pipeline:
-  1. Parse PDF into pages
+  1. Parse PDF into pages (text + image descriptions)
   2. Split pages into chunks
   3. Embed each chunk via Azure OpenAI
   4. Store document + chunks in Postgres
@@ -8,6 +8,7 @@ PDF ingestion pipeline:
 
 import os
 import re
+import base64
 import httpx
 import pymupdf
 from dotenv import load_dotenv
@@ -24,19 +25,101 @@ AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 CHUNK_SIZE = 500      # characters
 CHUNK_OVERLAP = 50   # characters
 
+# Vision — uses the same gpt-4.1 deployment via llm.py config
+AZURE_LLM_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+AZURE_LLM_KEY = os.getenv("AZURE_API_KEY")
+AZURE_LLM_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT", "gpt-4.1")
+AZURE_LLM_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+MIN_IMAGE_BYTES = 1024  # skip tiny images (icons, bullets)
+
 
 # ---------------------------------------------------------------------------
-# 1. Parse PDF
+# 1a. Vision: describe images on a page
+# ---------------------------------------------------------------------------
+
+def describe_image(image_bytes: bytes) -> str | None:
+    """Send image to GPT-4.1 vision and return a text description."""
+    b64 = base64.b64encode(image_bytes).decode()
+    url = (
+        f"{AZURE_LLM_ENDPOINT.rstrip('/')}/openai/deployments/"
+        f"{AZURE_LLM_DEPLOYMENT}/chat/completions?api-version={AZURE_LLM_API_VERSION}"
+    )
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Describe this image from a university lecture slide concisely. "
+                            "Focus on any diagrams, charts, formulas, or tables. "
+                            "Be specific about labels, values, and relationships shown. "
+                            "If it is decorative or contains no meaningful content, respond with: SKIP"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 300,
+        "temperature": 0,
+    }
+    try:
+        response = httpx.post(
+            url,
+            headers={"api-key": AZURE_LLM_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"].strip()
+        return None if content == "SKIP" else content
+    except Exception as e:
+        print(f"    [vision] error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 1. Parse PDF (text + image descriptions)
 # ---------------------------------------------------------------------------
 
 def parse_pdf(file_path: str) -> list[dict]:
-    """Return list of {page_number, text} dicts."""
+    """Return list of {page_number, text} dicts.
+    Text includes GPT-4.1 vision descriptions of any images on the page.
+    """
     pages = []
     with pymupdf.open(file_path) as doc:
         for i, page in enumerate(doc, start=1):
             text = page.get_text().strip()
-            if text:
-                pages.append({"page_number": i, "text": text})
+
+            # Extract and describe images on this page
+            image_descriptions = []
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                try:
+                    pix = pymupdf.Pixmap(doc, xref)
+                    if pix.n > 4:  # convert CMYK to RGB
+                        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+                    img_bytes = pix.tobytes("png")
+                    if len(img_bytes) < MIN_IMAGE_BYTES:
+                        continue  # skip tiny images
+                    desc = describe_image(img_bytes)
+                    if desc:
+                        image_descriptions.append(f"[Image on page {i}: {desc}]")
+                except Exception as e:
+                    print(f"    [vision] page {i} image error: {e}")
+
+            combined = text
+            if image_descriptions:
+                combined = text + "\n" + "\n".join(image_descriptions)
+                print(f"    page {i}: {len(image_descriptions)} image(s) described")
+
+            if combined.strip():
+                pages.append({"page_number": i, "text": combined})
     return pages
 
 
