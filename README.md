@@ -1,204 +1,224 @@
-# Easels — RAG Study Companion
+# Easels RAG + Estonian Summary Audio API
 
-A retrieval-augmented study tool. Upload course materials, then query them in natural language, get grounded answers with source citations, and quiz yourself on specific topics.
+This project is a study assistant backend that:
 
----
+- ingests PDF study materials into SQLite
+- retrieves relevant chunks with hybrid search
+- answers questions with Azure OpenAI
+- generates Estonian summary audio from retrieved chunks via external TTS
 
-## How It Works
+## Main Features
 
+- `ingest.py`
+  Loads PDFs, chunks text, creates embeddings, extracts concepts, and stores everything in SQLite.
+- `rag.py`
+  Retrieves relevant chunks and generates a grounded answer with citations.
+- `quiz.py`
+  Generates topic quizzes from stored chunks and evaluates answers.
+- `api.py`
+  Exposes a web API for summary generation and summary-to-speech.
+- `summary.py`
+  Builds an Estonian summary from retrieved chunks.
+- `speech.py`
+  Calls the external Estonian TTS project and saves a `.wav` file.
+
+## Project Structure
+
+```text
+hack/
+  api.py
+  summary.py
+  speech.py
+  ingest.py
+  query.py
+  rag.py
+  quiz.py
+  concepts.py
+  llm.py
+  requirements.txt
+  db/
+    connection.py
+    init_db.py
+    schema.sql
 ```
-PDF → parse → chunk → embed (Azure ada-002) → SQLite (sqlite-vec + FTS5)
-                                                        ↓
-                              LLM extracts master concepts per document
-                                                        ↓
-                              each chunk tagged to concepts (chunk_concepts)
-```
 
-When you ask a question:
+## Local Setup
 
-- Your question is embedded and matched against chunks via **vector search + keyword search (hybrid RRF)**
-- The top chunks are passed to **GPT-4.1** with a strict "cite sources only" instruction
-- The answer references which document and page it came from
-
----
-
-## Setup
-
-**1. Create and activate virtual environment**
+Create the virtual environment:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
 ```
 
-**2. Install dependencies**
+Install dependencies:
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-**3. Configure environment**
-
-```powershell
-copy .env.example .env
-```
-
-Open `.env` and fill in:
-
-- `AZURE_OPENAI_API_KEY` — key for the embedding model (ada-002)
-- `AZURE_API_KEY` — key for the chat model (gpt-4.1)
-
-Both keys currently point to the same Azure deployment (`teliaee-openai`).
-
-**4. Initialise the database**
+Initialize the database:
 
 ```powershell
 .venv\Scripts\python.exe -m db.init_db
 ```
 
-This creates `easels.db` (SQLite file, tracked by `.gitignore`).
+## Environment Variables
 
----
+Create a local `.env` file in the project root.
 
-## Ingesting Course Materials
+### Azure chat config
 
-```powershell
-.venv\Scripts\python.exe ingest.py "<file.pdf>" "<Lecture title>" "<Course name>"
+Used by `llm.py`.
+
+```env
+AZURE_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_API_KEY=your_chat_api_key
+AZURE_DEPLOYMENT=gpt-4.1
+AZURE_API_VERSION=2024-12-01-preview
 ```
 
-**Example:**
+### Azure embeddings config
 
-```powershell
-.venv\Scripts\python.exe ingest.py "konspekt.pdf" "Loeng 1" "Elektrisüsteem"
-.venv\Scripts\python.exe ingest.py "dbb.pdf" "Loeng 1" "Andmebaasid"
+Used by `query.py` and `ingest.py`.
+
+```env
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_KEY=your_embedding_api_key
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-ada-002
+AZURE_OPENAI_API_VERSION=2023-05-15
 ```
 
-What happens during ingest:
+### App config
 
-1. PDF is parsed into pages and split into ~500 character chunks
-2. All chunks are embedded via Azure ada-002
-3. The full document text is sent to GPT-4.1 once → extracts 5–15 master concepts
-4. Each chunk is assigned concepts from the master list (no new concepts created per chunk)
-5. Everything stored in `easels.db` — chunks, embeddings, FTS index, concepts, links
+```env
+SQLITE_DB_PATH=easels.db
 
----
+LLM_TEMPERATURE=0
+LLM_TOP_P=1.0
+LLM_PRESENCE_PENALTY=0.2
+LLM_MAX_TOKENS=2000
+```
 
-## Asking Questions (RAG)
+### Estonian TTS config
+
+Used by `speech.py`.
+
+```env
+ESTONIAN_TTS_ROOT=C:\txttospeech\text-to-speech
+ESTONIAN_TTS_PYTHON=C:\Users\your-user\anaconda3\envs\transformer-tts\python.exe
+ESTONIAN_TTS_SPEAKER=albert
+MEDIA_DIR=media
+```
+
+## Important TTS Note
+
+The summary audio endpoint does not include the TTS model itself.
+
+The backend machine must separately have:
+
+- the TartuNLP `text-to-speech` project
+- its models
+- a working Python or Conda environment that can run `synthesizer.py`
+
+This project calls that TTS installation through `ESTONIAN_TTS_ROOT` and `ESTONIAN_TTS_PYTHON`.
+
+## Ingesting PDFs
+
+```powershell
+.venv\Scripts\python.exe ingest.py "<file.pdf>" "<lecture title>" "<course name>"
+```
+
+Example:
+
+```powershell
+.venv\Scripts\python.exe ingest.py "konspekt.pdf" "Loeng 1" "Elektrisusteem"
+```
+
+## Asking Questions
 
 ```powershell
 .venv\Scripts\python.exe rag.py "<question>" ["<course>"]
 ```
 
-**Example:**
+Example:
 
 ```powershell
-.venv\Scripts\python.exe rag.py "Mis on nimipinge?" "Elektrisüsteem"
+.venv\Scripts\python.exe rag.py "Mis on nimipinge?" "Elektrisusteem"
 ```
 
-Returns a GPT-4.1 answer grounded strictly in the source material, with source citations (document + page).
+## Running the API
 
----
-
-## Web Summary Audio
-
-You can expose the project as a small web API that:
-
-- retrieves relevant chunks for a topic
-- generates an Estonian summary from those chunks
-- converts the summary to speech using `C:\txttospeech\text-to-speech`
-
-### Extra environment variables
-
-- `ESTONIAN_TTS_ROOT` - path to the TTS project, default `C:\txttospeech\text-to-speech`
-- `ESTONIAN_TTS_PYTHON` - optional Python executable for the TTS environment
-- `ESTONIAN_TTS_SPEAKER` - default voice, e.g. `albert`
-- `MEDIA_DIR` - folder where generated wav files are stored
-
-### Run the API
+Start the API locally:
 
 ```powershell
-.venv\Scripts\python.exe -m uvicorn api:app --reload
+.venv\Scripts\python.exe -m uvicorn api:app --reload --port 8010
 ```
 
-### Summary audio endpoint
+Swagger UI:
 
-`POST /api/summary-audio`
+```text
+http://127.0.0.1:8010/docs
+```
 
-Example body:
+Health check:
+
+```text
+GET /api/health
+```
+
+## Summary Audio Endpoint
+
+Endpoint:
+
+```text
+POST /api/summary-audio
+```
+
+Request body:
 
 ```json
 {
   "topic": "nimipinge",
-  "course": "Elektrisusteem",
+  "course": null,
   "top_k": 5,
+  "chunk_ids": [],
   "speaker": "albert"
 }
 ```
 
-You can also send explicit `chunk_ids` instead of a topic if the frontend already knows which chunks the user selected.
+Notes:
 
----
+- send `topic` to retrieve chunks through search
+- or send `chunk_ids` if the frontend already knows which chunks to summarize
+- `speaker` must match an available TTS voice such as `albert`, `kalev`, `kylli`, `mari`, `meelis`, or `vesta`
 
-## Quizzing on a Topic
+Example response:
 
-```powershell
-.venv\Scripts\python.exe quiz.py                                  # list available concepts
-.venv\Scripts\python.exe quiz.py "<concept>" ["<course>"] [n]     # run a quiz
+```json
+{
+  "summary": "Kokkuvote ...",
+  "sources": [
+    {
+      "id": 12,
+      "text": "...",
+      "page_number": 4,
+      "document_title": "Loeng 1",
+      "course": "Elektrisusteem"
+    }
+  ],
+  "audio_url": "/media/summary_xxxxx.wav"
+}
 ```
 
-**Example:**
+Generated audio files are served from:
 
-```powershell
-.venv\Scripts\python.exe quiz.py "nimipinged" "Elektrisüsteem" 5
+```text
+/media/<filename>.wav
 ```
-
-Flow:
-
-1. Fetches chunks tagged to the concept
-2. GPT-4.1 generates N questions from those chunks
-3. You answer each in the terminal
-4. Each answer is evaluated and feedback given with source citation
-5. Score summary + weak concepts highlighted at the end
-6. Result (percentage) saved to DB — personal best tracked per concept
-
----
-
-## Project Structure
-
-```
-easels/
-├── ingest.py         # PDF → chunks → embeddings → DB + concept extraction
-├── query.py          # Hybrid vector + FTS5 search with RRF merging
-├── rag.py            # query.py + LLM generation (full RAG)
-├── quiz.py           # /quiz-topic mode: generate → ask → evaluate → score
-├── concepts.py       # LLM concept extraction and DB management
-├── llm.py            # Azure OpenAI chat completion client
-├── requirements.txt
-├── .env.example      # Copy to .env and fill in keys
-└── db/
-    ├── __init__.py
-    ├── connection.py  # SQLite connection with sqlite-vec loaded
-    ├── init_db.py     # Run once to create tables
-    └── schema.sql     # Table definitions
-```
-
-## Database Schema (simplified)
-
-```
-documents        — title, course, source_file
-chunks           — text, page_number, document_id
-chunk_embeddings — vector(1536) per chunk (sqlite-vec)
-chunks_fts       — FTS5 full-text index
-concepts         — name, course, embedding (master concept list per document)
-chunk_concepts   — many-to-many: chunks ↔ concepts
-document_concepts— many-to-many: documents ↔ concepts
-quiz_results     — concept, score, percentage, best (personal best flag)
-```
-
----
 
 ## Notes
 
-- `easels.db` is in `.gitignore` — each teammate runs their own local DB and ingests PDFs themselves
-- PDF files are also gitignored — share them separately
-- The `.env` file is gitignored — never commit keys
+- `.env` is ignored and must never be committed
+- `media/` is ignored because it contains generated audio
+- `easels.db` is ignored because each environment may have different ingested materials
+- if no matching chunks are found, the API returns a valid response with a fallback summary saying that no source material was found
