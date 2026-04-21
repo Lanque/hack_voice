@@ -16,12 +16,14 @@ import os
 import shutil
 import tempfile
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from ingest import ingest
 from rag import rag
+from summary import build_summary
+from speech import synthesize
 from quiz import list_concepts as _list_concepts
 from quiz import (
     get_chunks_for_concept,
@@ -167,3 +169,48 @@ def quiz_result(req: QuizResultRequest):
 @app.get("/quiz/weak", summary="Get weakest concepts by quiz history")
 def quiz_weak(course: str | None = None, limit: int = 5):
     return {"weak_concepts": get_weak_concepts(course, limit)}
+
+
+# ---------------------------------------------------------------------------
+# Summary + Audio
+# ---------------------------------------------------------------------------
+
+class SummaryAudioRequest(BaseModel):
+    topic: str | None = None
+    course: str | None = None
+    top_k: int = 5
+    chunk_ids: list[int] = []
+    speaker: str = "mari"
+
+
+@app.post("/summary", summary="Estonian text summary from retrieved chunks")
+def summary(req: SummaryAudioRequest):
+    result = build_summary(
+        topic=req.topic,
+        course=req.course,
+        top_k=req.top_k,
+        chunk_ids=req.chunk_ids or None,
+    )
+    return result
+
+
+@app.post("/summary-audio", summary="Estonian summary as WAV audio")
+def summary_audio(req: SummaryAudioRequest):
+    result = build_summary(
+        topic=req.topic,
+        course=req.course,
+        top_k=req.top_k,
+        chunk_ids=req.chunk_ids or None,
+    )
+    summary_text = result["summary"]
+    try:
+        wav_bytes = synthesize(summary_text, speaker=req.speaker)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "X-Summary": summary_text[:500],
+        },
+    )
