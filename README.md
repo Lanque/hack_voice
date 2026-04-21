@@ -99,6 +99,46 @@ Returns a GPT-4.1 answer grounded strictly in the source material, with source c
 
 ---
 
+## Web Summary Audio
+
+You can expose the project as a small web API that:
+
+- retrieves relevant chunks for a topic
+- generates an Estonian summary from those chunks
+- converts the summary to speech using `C:\txttospeech\text-to-speech`
+
+### Extra environment variables
+
+- `ESTONIAN_TTS_ROOT` - path to the TTS project, default `C:\txttospeech\text-to-speech`
+- `ESTONIAN_TTS_PYTHON` - optional Python executable for the TTS environment
+- `ESTONIAN_TTS_SPEAKER` - default voice, e.g. `albert`
+- `MEDIA_DIR` - folder where generated wav files are stored
+
+### Run the API
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn api:app --reload
+```
+
+### Summary audio endpoint
+
+`POST /api/summary-audio`
+
+Example body:
+
+```json
+{
+  "topic": "nimipinge",
+  "course": "Elektrisusteem",
+  "top_k": 5,
+  "speaker": "albert"
+}
+```
+
+You can also send explicit `chunk_ids` instead of a topic if the frontend already knows which chunks the user selected.
+
+---
+
 ## Quizzing on a Topic
 
 ```powershell
