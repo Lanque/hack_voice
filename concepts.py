@@ -1,33 +1,24 @@
 """
 Concept extraction and management.
 
-Two-phase approach:
-  Phase 1 (once per document): feed full text to LLM → get 5-15 master concepts → store in DB
-  Phase 2 (per chunk): assign from existing master list only — no new concepts created
+Phase 1 extracts a bounded concept list for the whole document.
+Phase 2 assigns chunk-to-concept links, using a fast heuristic by default.
 """
 
+from __future__ import annotations
+
 import json
+import os
+import re
 import struct
-import math
+
 from db.connection import get_connection
 from llm import call_llm
 
 MAX_CONCEPTS_PER_CHUNK = 3
 MAX_DOCUMENT_CONCEPTS = 15
 MIN_DOCUMENT_CONCEPTS = 5
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+CHUNK_ASSIGNMENT_MODE = os.getenv("CHUNK_CONCEPT_ASSIGNMENT_MODE", "heuristic").lower()
 
 
 def _blob_to_vec(blob: bytes) -> list[float]:
@@ -39,17 +30,21 @@ def _vec_to_blob(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
 
-def _get_existing_concepts(course: str) -> list[dict]:
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-zA-ZÀ-ÿ0-9_-]+", _normalize(text))
+
+
+def get_existing_concepts(course: str) -> list[dict]:
     """Return all concepts for this course: {id, name, embedding}."""
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, name, embedding FROM concepts WHERE course = ?",
+            "SELECT id, name, embedding FROM concepts WHERE course = ? ORDER BY id",
             (course,),
         )
         rows = []
@@ -79,18 +74,6 @@ def _insert_concept(name: str, course: str, embedding: list[float]) -> int:
         conn.close()
 
 
-def _link_chunk_concept(chunk_id: int, concept_id: int):
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO chunk_concepts (chunk_id, concept_id) VALUES (?, ?)",
-            (chunk_id, concept_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def _link_document_concept(document_id: int, concept_id: int):
     conn = get_connection()
     try:
@@ -103,39 +86,34 @@ def _link_document_concept(document_id: int, concept_id: int):
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: extract master concept list from full document text
-# ---------------------------------------------------------------------------
-
 def extract_document_concepts(full_text: str, course: str, embed_fn, document_id: int) -> list[str]:
     """
-    Send the full document text to LLM once and extract a bounded master concept list.
+    Send the full document text to the LLM once and extract a bounded master concept list.
     Inserts concepts into the DB and returns their names.
     """
-    # Trim to avoid token limits (~12k chars ≈ ~3k tokens, safe for most models)
     trimmed = full_text[:12000]
 
     system = (
         "You are an academic concept extractor for a study tool. "
         "Identify the key concepts covered in this document. "
         "Respond ONLY with a JSON array of short concept names (1-3 words each), lowercase. "
-        "No explanation, no markdown — only the JSON array."
+        "No explanation, no markdown - only the JSON array."
     )
 
     prompt = (
         f"Document text:\n{trimmed}\n\n"
         f"Extract {MIN_DOCUMENT_CONCEPTS}-{MAX_DOCUMENT_CONCEPTS} key concepts that cover "
-        f"the main topics of this document. Be broad — these will be used to categorise "
+        f"the main topics of this document. Be broad - these will be used to categorise "
         f"all sections of the document. Use the same language as the document."
     )
 
     response = call_llm(prompt, system=system)
 
     try:
-        clean = response.strip().strip("```json").strip("```").strip()
+        clean = response.strip().removeprefix("```json").removesuffix("```").strip()
         names = json.loads(clean)
         if isinstance(names, list):
-            names = [str(n).lower().strip() for n in names if n][:MAX_DOCUMENT_CONCEPTS]
+            names = [str(name).lower().strip() for name in names if name][:MAX_DOCUMENT_CONCEPTS]
     except (json.JSONDecodeError, ValueError):
         names = []
 
@@ -145,7 +123,6 @@ def extract_document_concepts(full_text: str, course: str, embed_fn, document_id
 
     print(f"  Master concepts: {names}")
 
-    # Store in DB and link to document
     for name in names:
         embedding = embed_fn(name)
         concept_id = _insert_concept(name, course, embedding)
@@ -154,12 +131,8 @@ def extract_document_concepts(full_text: str, course: str, embed_fn, document_id
     return names
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: assign chunks to existing concepts only
-# ---------------------------------------------------------------------------
-
 def _assign_via_llm(chunk_text: str, existing_names: list[str]) -> list[str]:
-    existing_str = ", ".join(f'"{n}"' for n in existing_names)
+    existing_str = ", ".join(f'"{name}"' for name in existing_names)
 
     system = (
         "You are a concept tagging assistant for a study tool. "
@@ -177,32 +150,62 @@ def _assign_via_llm(chunk_text: str, existing_names: list[str]) -> list[str]:
     response = call_llm(prompt, system=system)
 
     try:
-        clean = response.strip().strip("```json").strip("```").strip()
+        clean = response.strip().removeprefix("```json").removesuffix("```").strip()
         chosen = json.loads(clean)
         if isinstance(chosen, list):
-            # Validate — only accept names that are in the existing list
-            valid = [str(c).lower().strip() for c in chosen if str(c).lower().strip() in existing_names]
+            valid = [
+                str(name).lower().strip()
+                for name in chosen
+                if str(name).lower().strip() in existing_names
+            ]
             return valid[:MAX_CONCEPTS_PER_CHUNK]
     except (json.JSONDecodeError, ValueError):
         pass
     return []
 
 
-def assign_concepts(chunk_id: int, chunk_text: str, course: str, embed_fn=None) -> list[str]:
+def _assign_via_heuristic(chunk_text: str, existing: list[dict]) -> list[str]:
+    normalized_text = _normalize(chunk_text)
+    text_tokens = set(_tokenize(chunk_text))
+    ranked: list[tuple[int, int, str]] = []
+
+    for item in existing:
+        concept_name = item["name"]
+        concept_tokens = _tokenize(concept_name)
+        exact_phrase = concept_name in normalized_text
+        overlap = len(text_tokens.intersection(concept_tokens))
+        if not exact_phrase and overlap == 0:
+            continue
+
+        ranked.append((
+            2 if exact_phrase else 1,
+            overlap,
+            concept_name,
+        ))
+
+    ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    return [name for _, _, name in ranked[:MAX_CONCEPTS_PER_CHUNK]]
+
+
+def assign_concepts_for_chunks(chunk_rows: list[dict], course: str) -> dict[int, list[str]]:
     """
-    Assign existing concepts to a chunk. Never creates new concepts.
-    Returns list of assigned concept names.
+    Return {chunk_id: [concept_name, ...]} for many chunks at once.
+    Uses heuristics by default because it is dramatically faster on large PDFs.
     """
-    existing = _get_existing_concepts(course)
+    existing = get_existing_concepts(course)
     if not existing:
-        return []
+        return {}
 
-    existing_names = [c["name"] for c in existing]
-    chosen_names = _assign_via_llm(chunk_text, existing_names)
+    existing_names = [item["name"] for item in existing]
+    chosen_by_chunk: dict[int, list[str]] = {}
 
-    for name in chosen_names:
-        concept = next((c for c in existing if c["name"] == name), None)
-        if concept:
-            _link_chunk_concept(chunk_id, concept["id"])
+    for row in chunk_rows:
+        chunk_id = row["id"]
+        chunk_text = row["text"]
+        if CHUNK_ASSIGNMENT_MODE == "llm":
+            chosen = _assign_via_llm(chunk_text, existing_names)
+        else:
+            chosen = _assign_via_heuristic(chunk_text, existing)
+        chosen_by_chunk[chunk_id] = chosen
 
-    return chosen_names
+    return chosen_by_chunk

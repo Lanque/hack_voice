@@ -16,10 +16,11 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ingest import ingest
@@ -29,17 +30,27 @@ from speech import synthesize
 from plan import generate_plan
 from homework_helper import homework_help
 from sm2 import update_sm2, get_next_concept
+from llm import call_llm
 from quiz import list_concepts as _list_concepts
 from quiz import (
     get_chunks_for_concept,
     generate_questions,
     evaluate_answer,
+    evaluate_answers_batch,
     save_quiz_result,
     get_weak_concepts,
 )
-from db.connection import get_connection
+from catalog import (
+    build_topic_payload,
+    get_stats,
+    get_topic_materials,
+    list_course_names,
+    list_topics,
+    search_topic_materials,
+)
 
 app = FastAPI(title="Easels API", version="0.1.0")
+MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,6 +95,16 @@ class QuizResultRequest(BaseModel):
     total: int
 
 
+class QuizBatchEvaluateItem(BaseModel):
+    question: str
+    student_answer: str
+    source_text: str
+
+
+class QuizBatchEvaluateRequest(BaseModel):
+    items: list[QuizBatchEvaluateItem]
+
+
 class PlanRequest(BaseModel):
     course: str | None = None
     days_until_exam: int
@@ -108,6 +129,18 @@ class SM2UpdateRequest(BaseModel):
     quality: int  # 0-5
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    context: list[str] = []
+    systemPrompt: str | None = None
+    model: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Ingest
 # ---------------------------------------------------------------------------
@@ -121,15 +154,20 @@ async def ingest_pdf(
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Save upload to a temp file then ingest
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (file.filename or "upload.pdf"))
+    stored_name = f"{uuid.uuid4().hex}_{safe_name}"
+    stored_path = os.path.abspath(os.path.join(MEDIA_DIR, stored_name))
+
+    with open(stored_path, "wb") as target:
+        shutil.copyfileobj(file.file, target)
 
     try:
-        ingest(tmp_path, title, course)
-    finally:
-        os.unlink(tmp_path)
+        ingest(stored_path, title, course)
+    except Exception:
+        if os.path.exists(stored_path):
+            os.unlink(stored_path)
+        raise
 
     return {"status": "ok", "title": title, "course": course}
 
@@ -145,13 +183,103 @@ def get_concepts(course: str | None = None):
 
 @app.get("/courses", summary="List all courses")
 def get_courses():
+    return {"courses": list_course_names()}
+
+
+@app.get("/courses/{course_id}/topics", summary="List topics for a course")
+def get_course_topics(course_id: str):
+    return {"topics": list_topics(course_id)}
+
+
+@app.get("/stats", summary="Frontend stats card data")
+def stats():
+    return get_stats()
+
+
+@app.get("/topics", summary="List topic cards for the frontend")
+def get_topics(course: str | None = None):
+    return {"topics": list_topics(course)}
+
+
+@app.get("/topics/{topic_id}", summary="Get topic detail")
+def get_topic(topic_id: int):
+    payload = build_topic_payload(topic_id, include_materials=False)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Topic not found.")
+    return payload
+
+
+@app.get("/topics/{topic_id}/materials", summary="Get topic source cards")
+def get_topic_source_cards(topic_id: int):
+    if not build_topic_payload(topic_id, include_materials=False):
+        raise HTTPException(status_code=404, detail="Topic not found.")
+    return get_topic_materials(topic_id)
+
+
+@app.get("/topics/{topic_id}/search", summary="Search within a topic's source material")
+def search_topic_source_cards(topic_id: int, q: str, limit: int = 5):
+    if not q.strip():
+        return {"matches": []}
+    if not build_topic_payload(topic_id, include_materials=False):
+        raise HTTPException(status_code=404, detail="Topic not found.")
+    return {"matches": search_topic_materials(topic_id, q, limit=limit)}
+
+
+@app.get("/documents/{document_id}/file", summary="Open original uploaded document")
+def get_document_file(document_id: int, page: int | None = None):
+    from db.connection import get_connection
+
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT course FROM documents WHERE course IS NOT NULL ORDER BY course")
-        return {"courses": [r["course"] for r in cur.fetchall()]}
+        cur.execute("SELECT title, source_file FROM documents WHERE id = ?", (document_id,))
+        row = cur.fetchone()
+        if row and row["source_file"] and os.path.exists(row["source_file"]):
+            filename = os.path.basename(row["source_file"])
+            return FileResponse(row["source_file"], media_type="application/pdf", filename=filename)
+
+        cur.execute(
+            """
+            SELECT page_number, text
+            FROM chunks
+            WHERE document_id = ?
+            ORDER BY COALESCE(page_number, 0), id
+            """,
+            (document_id,),
+        )
+        chunks = cur.fetchall()
     finally:
         conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document file not found.")
+    if not chunks:
+        raise HTTPException(status_code=404, detail="Stored document file is missing.")
+
+    pages: dict[int | None, list[str]] = {}
+    for chunk in chunks:
+        pages.setdefault(chunk["page_number"], []).append(chunk["text"])
+
+    lines = [
+        f"{row['title']}",
+        "",
+        "Original PDF is missing, so this is a reconstructed text export from stored chunks.",
+        "",
+    ]
+    selected_pages = pages.items()
+    if page is not None and page in pages:
+        selected_pages = [(page, pages[page])]
+
+    for page_number, page_chunks in selected_pages:
+        label = page_number if page_number is not None else "-"
+        lines.append(f"=== Page {label} ===")
+        lines.append("")
+        lines.append("\n\n".join(part.strip() for part in page_chunks if part and part.strip()))
+        lines.append("")
+
+    filename = f"{row['title']}.txt"
+    headers = {"Content-Disposition": f'inline; filename="{filename}"'}
+    return PlainTextResponse("\n".join(lines).strip(), headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +290,37 @@ def get_courses():
 def ask(req: RAGRequest):
     result = rag(req.question, course=req.course, top_k=req.top_k, history=req.history)
     return result
+
+
+@app.post("/chat", summary="Context-aware freeform chat used by the frontend editor")
+def chat(req: ChatRequest):
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="At least one message is required.")
+
+    transcript = []
+    for message in req.messages[-12:]:
+        role = "User" if message.role == "user" else "Assistant"
+        transcript.append(f"{role}: {message.content}")
+
+    context_text = "\n\n".join(
+        block.strip() for block in req.context if isinstance(block, str) and block.strip()
+    )
+    prompt_parts = []
+    if context_text:
+        prompt_parts.append(f"Context blocks:\n{context_text}")
+    prompt_parts.append("Conversation:\n" + "\n".join(transcript))
+    prompt_parts.append("Continue the conversation helpfully and concisely.")
+
+    try:
+        reply = call_llm(
+            "\n\n".join(prompt_parts),
+            system=req.systemPrompt
+            or "You are a helpful study assistant. Use the provided context when it is relevant.",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return {"reply": reply}
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +345,11 @@ def quiz_generate(req: QuizGenerateRequest):
 def quiz_evaluate(req: QuizEvaluateRequest):
     result = evaluate_answer(req.question, req.student_answer, req.source_text)
     return result
+
+
+@app.post("/quiz/evaluate-batch", summary="Evaluate multiple student answers")
+def quiz_evaluate_batch(req: QuizBatchEvaluateRequest):
+    return {"results": evaluate_answers_batch([item.model_dump() for item in req.items])}
 
 
 @app.post("/quiz/result", summary="Save a completed quiz result")
@@ -238,6 +402,11 @@ def tts(req: TTSRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.post("/topics/textToSpeech", summary="Alias for frontend text-to-speech requests")
+def topic_tts(req: TTSRequest):
+    return tts(req)
 
 
 # ---------------------------------------------------------------------------

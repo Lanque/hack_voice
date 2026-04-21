@@ -105,9 +105,9 @@ def generate_questions(chunks: list[dict], n: int = 5, concept: str = "") -> lis
         clean = response.strip().strip("```json").strip("```").strip()
         items = json.loads(clean)
         if not isinstance(items, list):
-            return []
+            return _fallback_questions(chunks, n=n, concept=concept)
     except (json.JSONDecodeError, ValueError):
-        return []
+        return _fallback_questions(chunks, n=n, concept=concept)
 
     questions = []
     for item in items[:n]:
@@ -115,6 +115,26 @@ def generate_questions(chunks: list[dict], n: int = 5, concept: str = "") -> lis
         source_chunk = chunks[idx] if 0 <= idx < len(chunks) else chunks[0]
         questions.append({
             "question": item.get("question", ""),
+            "source_text": source_chunk["text"],
+            "page_number": source_chunk["page_number"],
+            "document_title": source_chunk["document_title"],
+            "concept": concept,
+        })
+    return questions or _fallback_questions(chunks, n=n, concept=concept)
+
+
+def _fallback_questions(chunks: list[dict], n: int = 5, concept: str = "") -> list[dict]:
+    questions = []
+    templates = [
+        "Selgita oma sõnadega, mida allikas ütleb teema \"{concept}\" kohta.",
+        "Millised on selle lõigu järgi teema \"{concept}\" peamised omadused või seosed?",
+        "Too selle allika põhjal välja üks oluline definitsioon või väide teema \"{concept}\" kohta.",
+    ]
+
+    for index, source_chunk in enumerate(chunks[:n]):
+        template = templates[index % len(templates)]
+        questions.append({
+            "question": template.format(concept=concept or "see teema"),
             "source_text": source_chunk["text"],
             "page_number": source_chunk["page_number"],
             "document_title": source_chunk["document_title"],
@@ -159,6 +179,60 @@ def evaluate_answer(question: str, student_answer: str, source_text: str) -> dic
         }
     except (json.JSONDecodeError, ValueError):
         return {"correct": False, "feedback": response.strip()}
+
+
+def evaluate_answers_batch(items: list[dict]) -> list[dict]:
+    """
+    Evaluate many answers in one LLM call.
+    Each item must contain: question, student_answer, source_text.
+    Returns list of {correct, feedback}.
+    """
+    if not items:
+        return []
+
+    system = (
+        "You are a study tutor evaluating student answers. "
+        "Base every evaluation strictly on the provided source text. "
+        "Respond ONLY with a JSON array. Each item must be an object with "
+        "\"correct\" (boolean) and \"feedback\" (string). "
+        "Keep feedback to 1-2 short sentences and mention the key fact from the source."
+    )
+
+    blocks = []
+    for index, item in enumerate(items, 1):
+        blocks.append(
+            f"[Item {index}]\n"
+            f"Source text:\n{item['source_text']}\n\n"
+            f"Question: {item['question']}\n"
+            f"Student answer: {item['student_answer']}\n"
+        )
+
+    prompt = (
+        "Evaluate all items below in order.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nReturn exactly one JSON array item per input item, in the same order."
+    )
+
+    response = call_llm(prompt, system=system)
+
+    try:
+        clean = response.strip().strip("```json").strip("```").strip()
+        parsed = json.loads(clean)
+        if isinstance(parsed, list) and len(parsed) == len(items):
+            return [
+                {
+                    "correct": bool(result.get("correct", False)),
+                    "feedback": str(result.get("feedback", "")),
+                }
+                for result in parsed
+            ]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return [
+        evaluate_answer(item["question"], item["student_answer"], item["source_text"])
+        for item in items
+    ]
 
 
 # ---------------------------------------------------------------------------

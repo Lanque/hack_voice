@@ -13,7 +13,7 @@ import httpx
 import pymupdf
 from dotenv import load_dotenv
 from db.connection import get_connection
-from concepts import assign_concepts, extract_document_concepts
+from concepts import assign_concepts_for_chunks, extract_document_concepts, get_existing_concepts
 
 load_dotenv()
 
@@ -31,6 +31,22 @@ AZURE_LLM_KEY = os.getenv("AZURE_API_KEY")
 AZURE_LLM_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT", "gpt-4.1")
 AZURE_LLM_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
 MIN_IMAGE_BYTES = 1024  # skip tiny images (icons, bullets)
+ENABLE_VISION_DESCRIPTIONS = os.getenv("ENABLE_VISION_DESCRIPTIONS", "0").lower() in {"1", "true", "yes", "on"}
+MAX_IMAGES_PER_PAGE = int(os.getenv("MAX_IMAGES_PER_PAGE", "3"))
+VISION_DISABLED_REASON = None
+
+
+def _normalize_pdf_text(text: str) -> str:
+    """Remove common PDF table-of-contents leader noise before chunking."""
+    if not text:
+        return ""
+
+    cleaned = text.replace("\u00a0", " ")
+    cleaned = re.sub(r"[ \t]*[.·•]{4,}[ \t]*\d+\b", "", cleaned)
+    cleaned = re.sub(r"[.·•]{4,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +55,13 @@ MIN_IMAGE_BYTES = 1024  # skip tiny images (icons, bullets)
 
 def describe_image(image_bytes: bytes) -> str | None:
     """Send image to GPT-4.1 vision and return a text description."""
+    global VISION_DISABLED_REASON
+
+    if not ENABLE_VISION_DESCRIPTIONS:
+        return None
+    if VISION_DISABLED_REASON:
+        return None
+
     b64 = base64.b64encode(image_bytes).decode()
     url = (
         f"{AZURE_LLM_ENDPOINT.rstrip('/')}/openai/deployments/"
@@ -78,6 +101,13 @@ def describe_image(image_bytes: bytes) -> str | None:
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"].strip()
         return None if content == "SKIP" else content
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in {400, 401, 403, 404}:
+            VISION_DISABLED_REASON = f"vision disabled after HTTP {e.response.status_code}"
+            print(f"    [vision] {VISION_DISABLED_REASON}")
+            return None
+        print(f"    [vision] error: {e}")
+        return None
     except Exception as e:
         print(f"    [vision] error: {e}")
         return None
@@ -94,11 +124,11 @@ def parse_pdf(file_path: str) -> list[dict]:
     pages = []
     with pymupdf.open(file_path) as doc:
         for i, page in enumerate(doc, start=1):
-            text = page.get_text().strip()
+            text = _normalize_pdf_text(page.get_text())
 
             # Extract and describe images on this page
             image_descriptions = []
-            for img_info in page.get_images(full=True):
+            for img_info in page.get_images(full=True)[:MAX_IMAGES_PER_PAGE]:
                 xref = img_info[0]
                 try:
                     pix = pymupdf.Pixmap(doc, xref)
@@ -190,6 +220,7 @@ def store_document(document_id: int, course: str, chunks: list[dict], embeddings
     conn = get_connection()
     try:
         cur = conn.cursor()
+        inserted_rows: list[dict] = []
 
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             cur.execute(
@@ -206,10 +237,28 @@ def store_document(document_id: int, course: str, chunks: list[dict], embeddings
                 "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)",
                 (chunk_id, chunk["text"]),
             )
-            conn.commit()
+            inserted_rows.append({"id": chunk_id, "text": chunk["text"]})
 
-            concepts = assign_concepts(chunk_id, chunk["text"], course, embed_texts)
-            print(f"    chunk {i+1}/{len(chunks)}: {concepts}")
+            if (i + 1) % 50 == 0 or (i + 1) == len(chunks):
+                print(f"    stored {i+1}/{len(chunks)} chunks")
+
+        concept_map = assign_concepts_for_chunks(inserted_rows, course)
+        concept_rows = []
+        existing = {item["name"]: item["id"] for item in get_existing_concepts(course)}
+        for row in inserted_rows:
+            for name in concept_map.get(row["id"], []):
+                concept_id = existing.get(name)
+                if concept_id:
+                    concept_rows.append((row["id"], concept_id))
+
+        if concept_rows:
+            cur.executemany(
+                "INSERT OR IGNORE INTO chunk_concepts (chunk_id, concept_id) VALUES (?, ?)",
+                concept_rows,
+            )
+
+        conn.commit()
+        print(f"    linked concepts for {len(inserted_rows)} chunks")
     finally:
         conn.close()
 
